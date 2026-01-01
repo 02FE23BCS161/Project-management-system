@@ -637,14 +637,15 @@ app.put("/api/projects/:id/reject", auth, async (req, res) => {
 /* ================= MANAGER SETUP ================= */
 
 app.post("/api/projects/:id/manager-setup", auth, async (req, res) => {
-  try {
+    try {
     const {
       requirements,
       tasks,
       teamMembers,
       assignments,
-      projectDea/* ================= DELETE PROJECT (OWNER ONLY) ================= */
-
+      projectDeadline, // ✅ make sure this is correct
+    } = req.body;
+      
 app.delete("/api/projects/:id", auth, async (req, res) => {
   try {
     const { id } = req.params;
@@ -776,7 +777,7 @@ dline,
       });
 
       taskMap[i + 1] = task;
-    }
+    });
 
     // ===== ASSIGN TASKS =====
     for (const a of assignments) {
@@ -1870,3 +1871,4 @@ const PORT = process.env.PORT || 5000;
 app.listen(PORT, () =>
   console.log("🚀 Server running on http://localhost:" + PORT)
 );
+
