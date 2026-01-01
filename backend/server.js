@@ -4,15 +4,16 @@ const jwt = require("jsonwebtoken");
 const bcrypt = require("bcryptjs");
 const cors = require("cors");
 const cron = require("node-cron");
-const multer = require("multer"); // ✅ declared ONCE
+const multer = require("multer");
 const path = require("path");
 const fs = require("fs");
 require("dotenv").config();
 
 const app = express();
-app.use(cors());
+app.use(cors({ origin: "*" }));
 app.use(express.json());
-app.use("/uploads", express.static("uploads"));
+app.use("/uploads", express.static(path.join(__dirname, "uploads")));
+const BASE_URL = process.env.BASE_URL || "";
 
 /* ================= DATABASE ================= */
 
@@ -27,41 +28,52 @@ mongoose
 /* ================= MODELS ================= */
 
 // USER (NO GLOBAL ROLE)
-const UserSchema = new mongoose.Schema({
-  name: String,
-  phone: String,
-  email: { type: String, unique: true },
-  password: String,
-});
+const UserSchema = new mongoose.Schema(
+  {
+    name: { type: String, required: true },
+    phone: String,
+    email: { type: String, unique: true, required: true },
+    password: { type: String, required: true },
+  },
+  { timestamps: true }
+);
+
 const User = mongoose.model("User", UserSchema);
 
 // PROJECT (PROJECT-SCOPED ROLES)
 const ProjectSchema = new mongoose.Schema(
   {
-    title: String,
+    title: { type: String, required: true },
     description: String,
-    requirements: [String], // ✅ NEW
+    requirements: [String],
 
     owner: {
-      userId: mongoose.Schema.Types.ObjectId,
-      email: String,
+      userId: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
+      email: { type: String, required: true },
     },
 
     manager: {
-      userId: mongoose.Schema.Types.ObjectId,
+      userId: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
       email: String,
-      status: { type: String, enum: ["pending", "accepted"], default: "pending" },
+      status: {
+        type: String,
+        enum: ["pending", "accepted"],
+        default: "pending",
+      },
     },
 
-   team: [
-  {
-    userId: mongoose.Schema.Types.ObjectId,
-    email: String,
-    role: { type: String, enum: ["SCRUM_MASTER", "TEAM_MEMBER"] },
-    status: { type: String, enum: ["pending", "accepted"], default: "pending" },
-  },
-],
-
+    team: [
+      {
+        userId: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
+        email: String,
+        role: { type: String, enum: ["SCRUM_MASTER", "TEAM_MEMBER"] },
+        status: {
+          type: String,
+          enum: ["pending", "accepted"],
+          default: "pending",
+        },
+      },
+    ],
 
     requirementPdfPath: String,
     projectDeadline: Date,
@@ -74,12 +86,12 @@ const ProjectSchema = new mongoose.Schema(
   },
   { timestamps: true }
 );
+
 const Project = mongoose.model("Project", ProjectSchema);
 
 // TASK
 const TaskSchema = new mongoose.Schema(
   {
-    // ✅ TASK NUMBER (SECTION NUMBER: 1,2,3…)
     taskNumber: {
       type: Number,
       required: true,
@@ -94,13 +106,16 @@ const TaskSchema = new mongoose.Schema(
 
     projectId: {
       type: mongoose.Schema.Types.ObjectId,
+      ref: "Project",
       required: true,
       index: true,
     },
 
-    assignedTo: mongoose.Schema.Types.ObjectId,
+    assignedTo: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+    },
 
-    // ✅ STRONG DEADLINE (REQUIRED)
     deadline: {
       type: Date,
       required: true,
@@ -112,7 +127,6 @@ const TaskSchema = new mongoose.Schema(
       default: "todo",
     },
 
-    // ✅ DAY-BY-DAY TASK UPDATES (MEMBER ACTIVITY)
     dailyUpdates: [
       {
         date: {
@@ -129,6 +143,7 @@ const TaskSchema = new mongoose.Schema(
         },
         updatedBy: {
           type: mongoose.Schema.Types.ObjectId,
+          ref: "User",
           required: true,
         },
       },
@@ -137,14 +152,13 @@ const TaskSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
-// ✅ ENSURE UNIQUE TASK NUMBER PER PROJECT (VERY IMPORTANT)
+// ENSURE UNIQUE TASK NUMBER PER PROJECT
 TaskSchema.index({ projectId: 1, taskNumber: 1 }, { unique: true });
-
 
 const Task = mongoose.model("Task", TaskSchema);
 
+
 // NOTIFICATION
-// ================= NOTIFICATION MODEL =================
 const NotificationSchema = new mongoose.Schema(
   {
     userId: {
@@ -203,7 +217,7 @@ function auth(req, res, next) {
       process.env.JWT_SECRET
     );
 
-    // ✅ keep ObjectId directly
+    // Keep ObjectId directly
     req.user = { id: decoded._id };
     next();
   } catch (err) {
@@ -218,29 +232,28 @@ function auth(req, res, next) {
 */
 function getUserRoleInProject(project, userId) {
 
-  // 1️⃣ OWNER check
+  // OWNER check
   if (project.owner?.userId?.toString() === userId.toString()) {
     return "OWNER";
   }
 
-  // 2️⃣ MANAGER check
+  // MANAGER check
   if (project.manager?.userId?.toString() === userId.toString()) {
     return "MANAGER";
   }
 
-  // 3️⃣ TEAM MEMBER / SCRUM MASTER check
+  // TEAM MEMBER / SCRUM MASTER check
   const member = project.team.find(
     (m) => m.userId.toString() === userId.toString()
   );
 
   if (member) {
-    return member.role || "TEAM_MEMBER";
+    return (member.role || "TEAM_MEMBER").toUpperCase();
   }
 
-  // 4️⃣ Not part of project
+  // Not part of project
   return null;
 }
-
 
 /* ================= FILE UPLOAD ================= */
 
@@ -285,43 +298,90 @@ const upload = multer({
 /* ================= AUTH APIs ================= */
 
 app.post("/api/auth/signup", async (req, res) => {
-  const { name, phone, email, password } = req.body;
+  try {
+    const { name, phone, email, password } = req.body;
 
-  if (await User.findOne({ email }))
-    return res.status(400).json({ message: "User already exists" });
+    // Basic validation
+    if (!name || !email || !password) {
+      return res.status(400).json({ message: "Name, email, and password are required" });
+    }
 
-  const hash = await bcrypt.hash(password, 10);
-  await User.create({ name, phone, email, password: hash });
+    // Check if user already exists
+    const existingUser = await User.findOne({ email });
+    if (existingUser) {
+      return res.status(400).json({ message: "User already exists" });
+    }
 
-  res.json({ message: "Signup successful" });
+    // Hash password
+    const hashedPassword = await bcrypt.hash(password, 10);
+
+    // Create user
+    const user = await User.create({ name, phone, email, password: hashedPassword });
+
+    res.status(201).json({ message: "Signup successful", user: { id: user._id, name: user.name, email: user.email } });
+  } catch (err) {
+    console.error("Signup Error:", err);
+    res.status(500).json({ message: "Server error" });
+  }
 });
 
 app.post("/api/auth/login", async (req, res) => {
-  const { email, password } = req.body;
+  try {
+    const { email, password } = req.body;
 
-  const user = await User.findOne({ email });
-  if (!user || !(await bcrypt.compare(password, user.password)))
-    return res.status(401).json({ message: "Invalid credentials" });
+    // Basic validation
+    if (!email || !password) {
+      return res.status(400).json({ message: "Email and password are required" });
+    }
 
-const token = jwt.sign(
-  { _id: user._id },   // ✅ store ObjectId correctly
-  process.env.JWT_SECRET,
-  { expiresIn: "1d" }
-);
+    // Find user
+    const user = await User.findOne({ email });
+    if (!user) {
+      return res.status(401).json({ message: "Invalid credentials" });
+    }
 
-  res.json({ token });
+    // Compare password
+    const isMatch = await bcrypt.compare(password, user.password);
+    if (!isMatch) {
+      return res.status(401).json({ message: "Invalid credentials" });
+    }
+
+    // Generate JWT
+    const token = jwt.sign({ _id: user._id }, process.env.JWT_SECRET, { expiresIn: "1d" });
+
+    res.json({
+      message: "Login successful",
+      token,
+      user: { id: user._id, name: user.name, email: user.email },
+    });
+  } catch (err) {
+    console.error("Login Error:", err);
+    res.status(500).json({ message: "Server error" });
+  }
 });
 
 /* ================= USER SEARCH ================= */
 
 app.get("/api/users/search", auth, async (req, res) => {
-  const query = req.query.query || "";
-  const users = await User.find({
-    email: { $regex: query, $options: "i" },
-  })
-    .limit(10)
-    .select("email");
-  res.json(users);
+  try {
+    const query = req.query.query || "";
+
+    // Return empty array if query is too short
+    if (query.length < 1) {
+      return res.json([]);
+    }
+
+    const users = await User.find({
+      email: { $regex: query, $options: "i" }, // case-insensitive search
+    })
+      .limit(10)
+      .select("email name _id"); // include name & id for better UX
+
+    res.json({ users });
+  } catch (err) {
+    console.error("User Search Error:", err);
+    res.status(500).json({ message: "Server error" });
+  }
 });
 
 /* ================= CREATE PROJECT ================= */
@@ -331,34 +391,51 @@ app.post(
   auth,
   upload.single("requirementPdf"),
   async (req, res) => {
-    const { title, description, managerEmail } = req.body;
+    try {
+      const { title, description, managerEmail } = req.body;
 
-    const owner = await User.findById(req.user.id);
-    const manager = await User.findOne({ email: managerEmail });
+      // Validate required fields
+      if (!title || !description || !managerEmail) {
+        return res
+          .status(400)
+          .json({ message: "Title, description, and managerEmail are required" });
+      }
 
-    if (!manager)
-      return res.status(404).json({ message: "Manager email not found" });
+      const owner = await User.findById(req.user.id);
+      if (!owner) {
+        return res.status(404).json({ message: "Owner not found" });
+      }
 
-    const project = await Project.create({
-      title,
-      description,
-      owner: { userId: owner._id, email: owner.email },
-      manager: { userId: manager._id, email: manager.email },
-      requirementPdfPath: req.file?.path,
-    });
+      const manager = await User.findOne({ email: managerEmail });
+      if (!manager) {
+        return res.status(404).json({ message: "Manager email not found" });
+      }
 
-   await Notification.create({
-  userId: manager._id,
-  projectId: project._id,
-  type: "project-invite",
-  message: `You have been invited to manage project "${project.title}"`,
-});
+      // Save project
+      const project = await Project.create({
+        title,
+        description,
+        owner: { userId: owner._id, email: owner.email },
+        manager: { userId: manager._id, email: manager.email },
+        requirementPdfPath: req.file?.path,
+      });
 
+      // Notify manager
+      await Notification.create({
+        userId: manager._id,
+        projectId: project._id,
+        type: "project-invite",
+        message: `You have been invited to manage project "${project.title}"`,
+      });
 
-    res.json({
-      message: "Project created & manager invited",
-      projectId: project._id,
-    });
+      res.json({
+        message: "Project created & manager invited",
+        projectId: project._id,
+      });
+    } catch (err) {
+      console.error("Create Project Error:", err);
+      res.status(500).json({ message: "Server error" });
+    }
   }
 );
 
@@ -367,38 +444,43 @@ app.get("/api/projects/:id", auth, async (req, res) => {
   try {
     const { id } = req.params;
 
+    // Validate MongoDB ObjectId
     if (!mongoose.Types.ObjectId.isValid(id)) {
       return res.status(400).json({ message: "Invalid project ID" });
     }
 
+    // Fetch project
     const project = await Project.findById(id);
     if (!project) {
       return res.status(404).json({ message: "Project not found" });
     }
 
-    // 🔐 access check
+    // Check user role in project
     const role = getUserRoleInProject(project, req.user.id);
     if (!role) {
       return res.status(403).json({ message: "Access denied" });
     }
+
+    // Construct requirement file URL dynamically
+    const requirementFileUrl = project.requirementPdfPath
+      ? `${BASE_URL}/uploads/${path.basename(project.requirementPdfPath)}`
+      : null;
 
     res.json({
       id: project._id,
       title: project.title,
       description: project.description,
       requirements: project.requirements || [],
-      requirementFileUrl: project.requirementPdfPath
-        ? `http://localhost:5000/uploads/${path.basename(
-            project.requirementPdfPath
-          )}`
-        : null,
+      requirementFileUrl,
       projectDeadline: project.projectDeadline,
       status: project.status,
       role,
+      owner: project.owner,
+      manager: project.manager,
+      team: project.team,
       createdAt: project.createdAt,
       updatedAt: project.updatedAt,
     });
-
   } catch (err) {
     console.error("PROJECT FETCH ERROR:", err);
     res.status(500).json({ message: "Failed to load project" });
@@ -406,26 +488,21 @@ app.get("/api/projects/:id", auth, async (req, res) => {
 });
 
 /* ================= MANAGER EMAIL SUGGESTIONS ================= */
-
 app.get("/api/managers", auth, async (req, res) => {
-  console.log("📥 /api/managers HIT");
-  console.log("🔑 User:", req.user.id);
-  console.log("🔍 Query:", req.query.query);
-
   try {
     const query = (req.query.query || "").trim();
 
+    // Return empty array if no query
     if (!query) return res.json([]);
 
+    // Search users by email, limit results
     const users = await User.find({
       email: { $regex: query, $options: "i" },
     })
       .limit(10)
-      .select("email -_id");
+      .select("email -_id"); // only email, no _id
 
-    console.log("📤 Results:", users.length);
     res.json(users);
-
   } catch (err) {
     console.error("MANAGER SEARCH ERROR:", err);
     res.status(500).json([]);
@@ -443,33 +520,44 @@ app.put("/api/tasks/:taskId", auth, async (req, res) => {
     const { status } = req.body;
     const userId = req.user.id;
 
-    // 1️⃣ Find task
+    // Validate taskId
+    if (!mongoose.Types.ObjectId.isValid(taskId)) {
+      return res.status(400).json({ message: "Invalid task ID" });
+    }
+
+    // Find task
     const task = await Task.findById(taskId);
     if (!task) {
       return res.status(404).json({ message: "Task not found" });
     }
 
-    // 2️⃣ Find project of this task
+    // Find project of this task
     const project = await Project.findById(task.projectId);
     if (!project) {
       return res.status(404).json({ message: "Project not found" });
     }
 
-    // 3️⃣ Get role using MODULE 1
+    // Get role using role resolver
     const role = getUserRoleInProject(project, userId);
 
-    // 4️⃣ Permission check
+    // Permission check
     if (role !== "MANAGER" && role !== "SCRUM_MASTER") {
       return res.status(403).json({
         message: "Only Manager or Scrum Master can update tasks",
       });
     }
 
-    // 5️⃣ Update task
+    // Validate status value
+    const allowedStatuses = ["todo", "in-progress", "done"];
+    if (!allowedStatuses.includes(status)) {
+      return res.status(400).json({ message: "Invalid status value" });
+    }
+
+    // Update task
     task.status = status;
     await task.save();
 
-    res.json({ message: "Task updated successfully" });
+    res.json({ message: "Task updated successfully", task });
 
   } catch (error) {
     console.error("TASK UPDATE ERROR:", error);
@@ -477,71 +565,74 @@ app.put("/api/tasks/:taskId", auth, async (req, res) => {
   }
 });
 
-
 /* ================= ACCEPT / REJECT PROJECT ================= */
 
-
 app.put("/api/projects/:id/accept", auth, async (req, res) => {
-  const project = await Project.findById(req.params.id);
-
-  if (!project)
-    return res.status(404).json({ message: "Project not found" });
-
-  if (project.manager.userId.toString() !== req.user.id)
-    return res.status(403).json({ message: "Unauthorized" });
-
-  project.manager.status = "accepted";
-  project.status = "active";
-  await project.save();
-
-  res.json({
-    message: "Project accepted",
-    redirect: `manager-setup.html?projectId=${project._id}`,
-  });
-});
-app.put("/api/projects/:id/reject", auth, async (req, res) => {
-  const project = await Project.findById(req.params.id);
-
-  if (!project)
-    return res.status(404).json({ message: "Project not found" });
-
-  if (project.manager.userId.toString() !== req.user.id)
-    return res.status(403).json({ message: "Unauthorized" });
-
-  project.status = "rejected";
-  await project.save();
-
-  res.json({ message: "Project rejected" });
-});
-/* ================= DELETE PROJECT (OWNER ONLY) ================= */
-
-app.delete("/api/projects/:id", auth, async (req, res) => {
   try {
-    const project = await Project.findById(req.params.id);
+    const { id } = req.params;
 
+    // Validate project ID
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return res.status(400).json({ message: "Invalid project ID" });
+    }
+
+    const project = await Project.findById(id);
     if (!project) {
       return res.status(404).json({ message: "Project not found" });
     }
 
-    if (project.owner.userId.toString() !== req.user.id) {
-      return res
-        .status(403)
-        .json({ message: "Only owner can delete project" });
+    // Ensure only assigned manager can accept
+    if (project.manager.userId.toString() !== req.user.id) {
+      return res.status(403).json({ message: "Unauthorized" });
     }
 
-    await Task.deleteMany({ projectId: project._id });
-    await Notification.deleteMany({ projectId: project._id });
-    await MemberUpload.deleteMany({ projectId: project._id });
-    await ProjectChat.deleteMany({ projectId: project._id });
+    // Update statuses
+    project.manager.status = "accepted";
+    project.status = "active";
+    await project.save();
 
-    await Project.deleteOne({ _id: project._id });
+    res.json({
+      message: "Project accepted",
+      redirect: `manager-setup.html?projectId=${project._id}`,
+    });
 
-    res.json({ message: "Project deleted successfully" });
-  } catch (err) {
-    console.error("DELETE PROJECT ERROR:", err);
-    res.status(500).json({ message: "Project deletion failed" });
+  } catch (error) {
+    console.error("PROJECT ACCEPT ERROR:", error);
+    res.status(500).json({ message: "Server error" });
   }
 });
+
+app.put("/api/projects/:id/reject", auth, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    // Validate project ID
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return res.status(400).json({ message: "Invalid project ID" });
+    }
+
+    const project = await Project.findById(id);
+    if (!project) {
+      return res.status(404).json({ message: "Project not found" });
+    }
+
+    // Ensure only assigned manager can reject
+    if (project.manager.userId.toString() !== req.user.id) {
+      return res.status(403).json({ message: "Unauthorized" });
+    }
+
+    project.status = "rejected";
+    await project.save();
+
+    res.json({ message: "Project rejected" });
+
+  } catch (error) {
+    console.error("PROJECT REJECT ERROR:", error);
+    res.status(500).json({ message: "Server error" });
+  }
+});
+
+
   
 /* ================= MANAGER SETUP ================= */
 
@@ -552,7 +643,51 @@ app.post("/api/projects/:id/manager-setup", auth, async (req, res) => {
       tasks,
       teamMembers,
       assignments,
-      projectDeadline,
+      projectDea/* ================= DELETE PROJECT (OWNER ONLY) ================= */
+
+app.delete("/api/projects/:id", auth, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    // Validate project ID
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return res.status(400).json({ message: "Invalid project ID" });
+    }
+
+    const project = await Project.findById(id);
+    if (!project) {
+      return res.status(404).json({ message: "Project not found" });
+    }
+
+    // Only owner can delete
+    if (project.owner.userId.toString() !== req.user.id) {
+      return res
+        .status(403)
+        .json({ message: "Only owner can delete project" });
+    }
+
+    // Delete all related data
+    await Task.deleteMany({ projectId: project._id });
+    await Notification.deleteMany({ projectId: project._id });
+
+    // Ensure these models exist in your code
+    if (typeof MemberUpload !== "undefined") {
+      await MemberUpload.deleteMany({ projectId: project._id });
+    }
+    if (typeof ProjectChat !== "undefined") {
+      await ProjectChat.deleteMany({ projectId: project._id });
+    }
+
+    // Delete project itself
+    await Project.deleteOne({ _id: project._id });
+
+    res.json({ message: "Project deleted successfully" });
+  } catch (err) {
+    console.error("DELETE PROJECT ERROR:", err);
+    res.status(500).json({ message: "Project deletion failed" });
+  }
+});
+dline,
     } = req.body;
 
     const project = await Project.findById(req.params.id);
@@ -560,12 +695,12 @@ app.post("/api/projects/:id/manager-setup", auth, async (req, res) => {
       return res.status(404).json({ message: "Project not found" });
     }
 
-    // 🔐 ONLY MANAGER
+    // ONLY MANAGER
     if (project.manager.userId.toString() !== req.user.id) {
       return res.status(403).json({ message: "Only manager allowed" });
     }
 
-    // 🔥 REQUIRED FIX — manager must accept first
+    // REQUIRED FIX — manager must accept first
     if (project.manager.status !== "accepted") {
       return res
         .status(403)
@@ -599,7 +734,7 @@ app.post("/api/projects/:id/manager-setup", auth, async (req, res) => {
         status: "pending",
       });
 
-      // 🔔 TEAM INVITE (NO DUPLICATES)
+      // TEAM INVITE (NO DUPLICATES)
       const alreadyInvited = await Notification.findOne({
         userId: user._id,
         projectId: project._id,
@@ -653,7 +788,7 @@ app.post("/api/projects/:id/manager-setup", auth, async (req, res) => {
       task.assignedTo = user._id;
       await task.save();
 
-      // 🔔 TASK ASSIGN NOTIFICATION (NO DUPLICATES)
+      // TASK ASSIGN NOTIFICATION (NO DUPLICATES)
       const taskNotifExists = await Notification.findOne({
         userId: user._id,
         taskId: task._id,
@@ -693,8 +828,8 @@ app.put("/api/projects/:id/team/accept", auth, async (req, res) => {
   if (!member)
     return res.status(404).json({ message: "Invite not found" });
 
-  member.status = "accepted"; // ✅ ADDED
-  await project.save();       // ✅ ADDED
+  member.status = "accepted"; // ADDED
+  await project.save();       // ADDED
 
   res.json({
     message: "Team member accepted",
@@ -777,7 +912,7 @@ const ProjectChat = mongoose.model("ProjectChat", ProjectChatSchema);
 
 
 // ================= MEMBER DASHBOARD (SIMPLE & WORKING) =================
-/* ================= MEMBER DASHBOARD (UPDATED – SECTIONS BASED) ================= */
+/* ================= MEMBER DASHBOARD (UPDATED – BASE_URL) ================= */
 app.get("/api/projects/:projectId/member/dashboard", auth, async (req, res) => {
   try {
     const { projectId } = req.params;
@@ -792,7 +927,7 @@ app.get("/api/projects/:projectId/member/dashboard", auth, async (req, res) => {
       return res.status(404).json({ message: "Project not found" });
     }
 
-    // 🔐 SECURITY CHECK
+    // SECURITY CHECK
     const role = getUserRoleInProject(project, userId);
     if (!role) {
       return res.status(403).json({ message: "Not a project member" });
@@ -841,10 +976,9 @@ app.get("/api/projects/:projectId/member/dashboard", auth, async (req, res) => {
         sprintLabel: u.sprintLabel,
         note: u.note,
         uploadedAt: u.createdAt,
-        url: `http://localhost:5000/uploads/${path.basename(u.filePath)}`,
+        url: `${BASE_URL}/uploads/${path.basename(u.filePath)}`, // ✅ BASE_URL
       })),
 
-      // ✅ THIS IS WHAT YOUR FRONTEND EXPECTS
       sections: sections.map((s) => ({
         _id: s._id,
         title: s.title,
@@ -864,6 +998,7 @@ app.get("/api/projects/:projectId/member/dashboard", auth, async (req, res) => {
     res.status(500).json({ message: "Failed to load member dashboard" });
   }
 });
+
 /* ================= SECTION STATUS UPDATE (MEMBER) ================= */
 /* ================= SECTION STATUS UPDATE (FIXED) ================= */
 app.post("/api/sections/:sectionId/update", auth, async (req, res) => {
@@ -1099,56 +1234,78 @@ app.get("/api/projects/:id/dashboard", auth, async (req, res) => {
 
 // GET CHAT MESSAGES
 app.get("/api/projects/:projectId/chat", auth, async (req, res) => {
-  const { projectId } = req.params;
-  const project = await Project.findById(projectId);
-if (!project) {
-  return res.status(404).json({ message: "Project not found" });
-}
+  try {
+    const { projectId } = req.params;
 
-const role = getUserRoleInProject(project, req.user.id);
-if (!role) {
-  return res.status(403).json({ message: "Not a project member" });
-}
+    // ✅ Validate ObjectId first
+    if (!mongoose.Types.ObjectId.isValid(projectId)) {
+      return res.status(400).json({ message: "Invalid project ID" });
+    }
 
-  if (!mongoose.Types.ObjectId.isValid(projectId)) {
-    return res.status(400).json({ message: "Invalid project ID" });
+    // ✅ Check if project exists
+    const project = await Project.findById(projectId);
+    if (!project) {
+      return res.status(404).json({ message: "Project not found" });
+    }
+
+    // ✅ Check if user is part of project
+    const role = getUserRoleInProject(project, req.user.id);
+    if (!role) {
+      return res.status(403).json({ message: "Not a project member" });
+    }
+
+    // ✅ Fetch chat messages
+    const chat = await ProjectChat.find({ projectId }).sort({ createdAt: 1 });
+
+    res.json(chat);
+  } catch (err) {
+    console.error("GET PROJECT CHAT ERROR:", err);
+    res.status(500).json({ message: "Failed to load chat messages" });
   }
-
-  const chat = await ProjectChat.find({ projectId })
-    .sort({ createdAt: 1 });
-
-  res.json(chat);
 });
 
 // SEND CHAT MESSAGE
 app.post("/api/projects/:projectId/chat", auth, async (req, res) => {
-  const { projectId } = req.params;
-  const { message } = req.body;
+  try {
+    const { projectId } = req.params;
+    const { message } = req.body;
 
-  if (!message || !message.trim()) {
-    return res.status(400).json({ message: "Message is required" });
+    if (!message || !message.trim()) {
+      return res.status(400).json({ message: "Message is required" });
+    }
+
+    if (!mongoose.Types.ObjectId.isValid(projectId)) {
+      return res.status(400).json({ message: "Invalid project ID" });
+    }
+
+    // ✅ Check if project exists
+    const project = await Project.findById(projectId);
+    if (!project) {
+      return res.status(404).json({ message: "Project not found" });
+    }
+
+    // ✅ Check if user is part of project
+    const role = getUserRoleInProject(project, req.user.id);
+    if (!role) {
+      return res.status(403).json({ message: "Not a project member" });
+    }
+
+    // ✅ Get user info
+    const user = await User.findById(req.user.id);
+
+    // ✅ Create chat message
+    const chat = await ProjectChat.create({
+      projectId,
+      senderId: user._id,
+      senderName: user.name,
+      message: message.trim(),
+    });
+
+    res.json(chat);
+  } catch (err) {
+    console.error("SEND PROJECT CHAT ERROR:", err);
+    res.status(500).json({ message: "Failed to send chat message" });
   }
-
-  const project = await Project.findById(projectId);
-  if (!project) {
-    return res.status(404).json({ message: "Project not found" });
-  }
-
-  const role = getUserRoleInProject(project, req.user.id);
-  if (!role) {
-    return res.status(403).json({ message: "Not a project member" });
-  }
-
-  const user = await User.findById(req.user.id);
-
-  const chat = await ProjectChat.create({
-    projectId,
-    senderId: user._id,
-    senderName: user.name,
-    message,
-  });
-
-  res.json(chat);
 });
 
 /* ================= MEMBER UPLOAD (UPDATED & FIXED) ================= */
@@ -1162,25 +1319,29 @@ app.post(
       const userId = req.user.id;
       const { taskId } = req.body;
 
-      // ❌ No file
+      // ✅ Validate projectId and taskId
+      if (!mongoose.Types.ObjectId.isValid(projectId)) {
+        return res.status(400).json({ message: "Invalid project ID" });
+      }
+
+      if (!taskId || !mongoose.Types.ObjectId.isValid(taskId)) {
+        return res.status(400).json({ message: "Valid task ID is required" });
+      }
+
+      // ❌ No file uploaded
       if (!req.file) {
         return res.status(400).json({ message: "No file uploaded" });
       }
 
-      // ❌ No taskId (CRITICAL)
-      if (!taskId) {
-        return res.status(400).json({ message: "Task ID is required" });
-      }
-
       // ✅ Save upload
-      await MemberUpload.create({
+      const uploadRecord = await MemberUpload.create({
         projectId: new mongoose.Types.ObjectId(projectId),
         memberId: new mongoose.Types.ObjectId(userId),
         fileName: req.file.originalname,
         filePath: req.file.path,
       });
 
-      // ✅ Find EXACT task (not random)
+      // ✅ Find task assigned to this member
       const task = await Task.findOne({
         _id: taskId,
         projectId,
@@ -1188,15 +1349,17 @@ app.post(
       });
 
       if (!task) {
-        return res.status(404).json({ message: "Task not found for member" });
+        return res.status(404).json({ message: "Task not found for this member" });
       }
 
-      // ✅ MARK TASK DONE (THIS IS THE PART YOU ASKED)
+      // ✅ Mark task as done automatically
       task.status = "done";
       await task.save();
 
       res.json({
         message: "Upload successful and task marked as done",
+        uploadId: uploadRecord._id,
+        taskId: task._id,
       });
     } catch (err) {
       console.error("UPLOAD ERROR:", err);
@@ -1204,9 +1367,6 @@ app.post(
     }
   }
 );
-
-
-
 
 // ================= PROJECT MEMBERS (MANAGER / OWNER) =================
 app.get("/api/projects/:id/members", auth, async (req, res) => {
@@ -1277,107 +1437,90 @@ app.get(
   "/api/projects/:projectId/members/:memberId/detail",
   auth,
   async (req, res) => {
-    const { projectId, memberId } = req.params;
+    try {
+      const { projectId, memberId } = req.params;
 
-    const project = await Project.findById(projectId);
+      if (!mongoose.Types.ObjectId.isValid(projectId) || !mongoose.Types.ObjectId.isValid(memberId)) {
+        return res.status(400).json({ message: "Invalid project or member ID" });
+      }
 
-    const isOwner =
-      project.owner.userId.toString() === req.user.id;
-    const isManager =
-      project.manager.userId.toString() === req.user.id;
+      const project = await Project.findById(projectId).lean();
+      if (!project) {
+        return res.status(404).json({ message: "Project not found" });
+      }
 
-    if (!isOwner && !isManager) {
-      return res
-        .status(403)
-        .json({ message: "Only owner or manager allowed" });
+      const isOwner = project.owner?.userId?.toString() === req.user.id;
+      const isManager = project.manager?.userId?.toString() === req.user.id;
+
+      if (!isOwner && !isManager) {
+        return res.status(403).json({ message: "Only owner or manager allowed" });
+      }
+
+      const uploads = await MemberUpload.find({
+        projectId,
+        memberId,
+      })
+        .sort({ createdAt: -1 })
+        .lean();
+
+      const tasks = await Task.find({
+        projectId,
+        assignedTo: memberId,
+      }).lean();
+
+      res.json({
+        uploads: uploads.map((u) => ({
+          fileName: u.fileName,
+          uploadedAt: u.createdAt,
+          url: `http://localhost:5000/uploads/${path.basename(u.filePath)}`,
+        })),
+        tasks: tasks.map((t) => ({
+          title: t.title,
+          status: t.status,
+          lastUpdate: t.updatedAt,
+        })),
+      });
+    } catch (err) {
+      console.error("MEMBER DETAIL ERROR:", err);
+      res.status(500).json({ message: "Failed to load member details" });
     }
-
-    const uploads = await MemberUpload.find({
-      projectId,
-      memberId,
-    }).sort({ createdAt: -1 });
-
-    const tasks = await Task.find({
-      projectId,
-      assignedTo: memberId,
-    });
-
-    res.json({
-      uploads: uploads.map((u) => ({
-        fileName: u.fileName,
-        uploadedAt: u.createdAt,
-        url: `http://localhost:5000/uploads/${path.basename(
-          u.filePath
-        )}`,
-      })),
-      tasks: tasks.map((t) => ({
-        title: t.title,
-        status: t.status,
-        lastUpdate: t.updatedAt,
-      })),
-    });
   }
 );
 
+// ================= PROFILE API =================
 app.get("/api/profile", auth, async (req, res) => {
   try {
     const userId = new mongoose.Types.ObjectId(req.user.id);
 
-    // ✅ USER
     const user = await User.findById(userId).lean();
-    if (!user) {
-      return res.status(404).json({ message: "User not found" });
-    }
+    if (!user) return res.status(404).json({ message: "User not found" });
 
-    // ✅ PROJECTS (OWNER / MANAGER / TEAM)
     const projects = await Project.find({
       $or: [
         { "owner.userId": userId },
         { "manager.userId": userId },
-        { "team.userId": userId }
+        { "team.userId": userId },
       ],
     }).lean();
 
-    // ✅ TASKS (FIXED QUERY)
-    const tasks = await Task.find({
-      assignedTo: userId
-    })
+    const tasks = await Task.find({ assignedTo: userId })
       .sort({ updatedAt: -1 })
       .lean();
 
-    // ✅ TASK STATS
-    const tasksCompleted = tasks.filter(
-      (task) => task.status === "done"
-    ).length;
-
+    const tasksCompleted = tasks.filter((t) => t.status === "done").length;
     const totalTasks = tasks.length;
     const hoursLogged = tasksCompleted * 2;
 
-    // ✅ ROLE DETECTION
     let role = "Team Member";
+    if (projects.some((p) => p.owner?.userId?.toString() === userId.toString())) role = "Owner";
+    else if (projects.some((p) => p.manager?.userId?.toString() === userId.toString())) role = "Manager";
 
-    if (
-      projects.some(
-        (p) => p.owner?.userId?.toString() === userId.toString()
-      )
-    ) {
-      role = "Owner";
-    } else if (
-      projects.some(
-        (p) => p.manager?.userId?.toString() === userId.toString()
-      )
-    ) {
-      role = "Manager";
-    }
-
-    // ✅ RECENT ACTIVITY
     const recentActivity = tasks.slice(0, 5).map((task) => ({
       label: `Task "${task.title}" marked as ${task.status}`,
       time: new Date(task.updatedAt || task.createdAt).toLocaleDateString(),
       meta: "Task update",
     }));
 
-    // ✅ RESPONSE
     res.json({
       name: user.name,
       email: user.email,
@@ -1389,9 +1532,8 @@ app.get("/api/profile", auth, async (req, res) => {
       hoursLogged,
       recentActivity,
     });
-
-  } catch (error) {
-    console.error("PROFILE ERROR:", error);
+  } catch (err) {
+    console.error("PROFILE ERROR:", err);
     res.status(500).json({ message: "Profile load failed" });
   }
 });
@@ -1401,10 +1543,8 @@ app.get("/api/dashboard", auth, async (req, res) => {
   try {
     const userId = new mongoose.Types.ObjectId(req.user.id);
 
-    const user = await User.findById(userId);
-    if (!user) {
-      return res.status(404).json({ message: "User not found" });
-    }
+    const user = await User.findById(userId).lean();
+    if (!user) return res.status(404).json({ message: "User not found" });
 
     const projects = await Project.find({
       $or: [
@@ -1416,15 +1556,10 @@ app.get("/api/dashboard", auth, async (req, res) => {
 
     const tasks = await Task.find({ assignedTo: userId }).lean();
 
-    const activeProjects = projects.filter(
-      (p) => p.status === "active"
-    ).length;
+    const activeProjects = projects.filter(p => p.status === "active").length;
 
     const upcomingDeadlines = tasks.filter(
-      (t) =>
-        t.deadline &&
-        new Date(t.deadline) >= new Date() &&
-        t.status !== "done"
+      t => t.deadline && t.deadline >= new Date() && t.status !== "done"
     ).length;
 
     const notifications = await Notification.find({ userId })
@@ -1442,7 +1577,7 @@ app.get("/api/dashboard", auth, async (req, res) => {
         myTasks: tasks.length,
         upcomingDeadlines,
       },
-      projects: projects.map((p) => ({
+      projects: projects.map(p => ({
         id: p._id,
         title: p.title,
         role:
@@ -1460,14 +1595,9 @@ app.get("/api/dashboard", auth, async (req, res) => {
     res.status(500).json({ message: "Dashboard load failed" });
   }
 });
-// ✅ STATIC ROUTES FIRST
-// ✅ MUST BE BEFORE /api/projects/:id
-// ================= DASHBOARD SLIDER APIs =================
 
-// ✅ MUST BE BEFORE ANY /api/projects/:id
+// ================= DASHBOARD SLIDER / ACTIVE PROJECTS =================
 app.get("/api/projects/active-projects", auth, async (req, res) => {
-  console.log("🔥 ACTIVE PROJECTS API HIT");
-
   try {
     const userId = new mongoose.Types.ObjectId(req.user.id);
 
@@ -1497,23 +1627,31 @@ app.get("/api/projects/active-projects", auth, async (req, res) => {
     res.status(500).json({ message: "Active projects failed" });
   }
 });
-/**
- * UPCOMING DEADLINES
- */
-app.get("/api/deadlines/upcoming", auth, async (req, res) => {
-  const tasks = await Task.find({
-    assignedTo: req.user.id,
-    deadline: { $gte: new Date() },
-    status: { $ne: "done" },
-  }).lean();
 
-  res.json(
-    tasks.map((t) => ({
-      id: t._id,
-      title: t.title,
-      dueDate: t.deadline,
-    }))
-  );
+// UPCOMING DEADLINES
+app.get("/api/deadlines/upcoming", auth, async (req, res) => {
+  try {
+    const userId = new mongoose.Types.ObjectId(req.user.id);
+
+    const tasks = await Task.find({
+      assignedTo: userId,
+      deadline: { $gte: new Date() },
+      status: { $ne: "done" },
+    })
+      .sort({ deadline: 1 })
+      .lean();
+
+    res.json(
+      tasks.map((t) => ({
+        id: t._id,
+        title: t.title,
+        dueDate: t.deadline ? t.deadline.toISOString() : null,
+      }))
+    );
+  } catch (err) {
+    console.error("UPCOMING DEADLINES ERROR:", err);
+    res.status(500).json({ message: "Failed to load upcoming deadlines" });
+  }
 });
 
 // ================= DAILY TASK UPDATE (MEMBER) =================
@@ -1521,10 +1659,15 @@ app.post("/api/tasks/:taskId/daily-update", auth, async (req, res) => {
   try {
     const { taskId } = req.params;
     const { status, note } = req.body;
-    const userId = req.user.id;
+    const userId = new mongoose.Types.ObjectId(req.user.id);
 
     if (!note) {
       return res.status(400).json({ message: "Note is required" });
+    }
+
+    const validStatuses = ["in-progress", "done"];
+    if (!validStatuses.includes(status)) {
+      return res.status(400).json({ message: "Invalid status" });
     }
 
     const task = await Task.findById(taskId);
@@ -1533,19 +1676,20 @@ app.post("/api/tasks/:taskId/daily-update", auth, async (req, res) => {
     }
 
     // 🔐 Only assigned member can update
-    if (task.assignedTo?.toString() !== userId.toString()) {
+    if (!task.assignedTo || task.assignedTo.toString() !== userId.toString()) {
       return res.status(403).json({ message: "Not your task" });
     }
 
     // ✅ Push daily update
     task.dailyUpdates.push({
+      date: new Date(),
       status,
       note,
       updatedBy: userId,
     });
 
     // ✅ Sync main task status
-    task.status = status === "done" ? "done" : "in-progress";
+    task.status = status;
 
     await task.save();
 
@@ -1555,6 +1699,7 @@ app.post("/api/tasks/:taskId/daily-update", auth, async (req, res) => {
     res.status(500).json({ message: "Server error" });
   }
 });
+
 
 /* ======================================================
    DYNAMIC ROUTES (ALWAYS AFTER STATIC ROUTES)
