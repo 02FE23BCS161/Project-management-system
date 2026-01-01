@@ -637,7 +637,7 @@ app.put("/api/projects/:id/reject", auth, async (req, res) => {
 /* ================= MANAGER SETUP ================= */
 
 app.post("/api/projects/:id/manager-setup", auth, async (req, res) => {
-    try {
+  try {
     const {
       requirements,
       tasks,
@@ -645,7 +645,124 @@ app.post("/api/projects/:id/manager-setup", auth, async (req, res) => {
       assignments,
       projectDeadline, // ✅ make sure this is correct
     } = req.body;
-      
+
+    const project = await Project.findById(req.params.id);
+    if (!project) {
+      return res.status(404).json({ message: "Project not found" });
+    }
+
+    // ===== MANAGER VALIDATION =====
+    if (!project.manager || project.manager.userId.toString() !== req.user.id) {
+      return res.status(403).json({ message: "Only assigned manager allowed" });
+    }
+
+    if (project.manager.status !== "accepted") {
+      return res.status(403).json({ message: "Manager must accept project first" });
+    }
+
+    // ===== INPUT VALIDATION =====
+    if (!projectDeadline) {
+      return res.status(400).json({ message: "Project deadline required" });
+    }
+
+    if (!tasks || tasks.length === 0) {
+      return res.status(400).json({ message: "At least one task required" });
+    }
+
+    // ===== SAVE PROJECT DATA =====
+    project.requirements = requirements || [];
+    project.projectDeadline = projectDeadline;
+
+    // ===== RESET TEAM =====
+    project.team = [];
+    for (const member of teamMembers) {
+      const user = await User.findOne({ email: member.email });
+      if (!user) continue;
+
+      project.team.push({
+        userId: user._id,
+        email: user.email,
+        role: member.role,
+        status: "pending",
+      });
+
+      // TEAM INVITE NOTIFICATION (NO DUPLICATES)
+      const alreadyInvited = await Notification.findOne({
+        userId: user._id,
+        projectId: project._id,
+        type: "team-add",
+      });
+
+      if (!alreadyInvited) {
+        await Notification.create({
+          userId: user._id,
+          projectId: project._id,
+          type: "team-add",
+          message: `You were added to project "${project.title}"`,
+        });
+      }
+    }
+
+    // ===== RESET OLD TASKS =====
+    await Task.deleteMany({ projectId: project._id });
+
+    // ===== CREATE NEW TASKS =====
+    const taskMap = {};
+    for (let i = 0; i < tasks.length; i++) {
+      const t = tasks[i];
+
+      if (!t.deadline) {
+        return res.status(400).json({ message: `Deadline missing for task ${i + 1}` });
+      }
+
+      const task = await Task.create({
+        taskNumber: i + 1,
+        title: t.title,
+        description: t.description,
+        projectId: project._id,
+        deadline: t.deadline,
+        status: "todo",
+      });
+
+      taskMap[i + 1] = task;
+    }
+
+    // ===== ASSIGN TASKS =====
+    for (const a of assignments) {
+      const task = taskMap[a.taskNumber];
+      const user = await User.findOne({ email: a.assignee });
+
+      if (!task || !user) continue;
+
+      task.assignedTo = user._id;
+      await task.save();
+
+      // TASK ASSIGN NOTIFICATION (NO DUPLICATES)
+      const taskNotifExists = await Notification.findOne({
+        userId: user._id,
+        taskId: task._id,
+        type: "task-assign",
+      });
+
+      if (!taskNotifExists) {
+        await Notification.create({
+          userId: user._id,
+          projectId: project._id,
+          taskId: task._id,
+          type: "task-assign",
+          message: `Task ${task.taskNumber}: "${task.title}" assigned to you`,
+        });
+      }
+    }
+
+    await project.save();
+
+    res.json({ message: "Manager setup completed successfully" });
+  } catch (err) {
+    console.error("MANAGER SETUP ERROR:", err);
+    res.status(500).json({ message: "Manager setup failed" });
+  }
+});
 app.delete("/api/projects/:id", auth, async (req, res) => {
   try {
     const { id } = req.params;
@@ -1871,4 +1988,5 @@ const PORT = process.env.PORT || 5000;
 app.listen(PORT, () =>
   console.log("🚀 Server running on http://localhost:" + PORT)
 );
+
 
